@@ -112,7 +112,7 @@ class MLP(nn.Module):
         x_device = self.dropout(x_device)
         return x_device
 
-class ShardBlockNoCommunication(nn.Module):
+class BlockNoCommunication(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -128,7 +128,7 @@ class ShardBlockNoCommunication(nn.Module):
 
 
 
-class ShardBlockPartialCommunication(nn.Module):
+class BlockPartialCommunication(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -142,22 +142,24 @@ class ShardBlockPartialCommunication(nn.Module):
         self.mlp1 = MLP(config) ## first MLP
         self.mlp2 = MLP(config) ## second MLP
 
-    def forward(self, x):
+    def forward(self, x_1, x_2):
         # First stream: attention then MLP
-        output_attn1 = self.attn1(self.ln_1_1(x))
-        x_1 = x + output_attn1
+        output_attn1 = self.attn1(self.ln_1_1(x_1))
+        x_1 = x_1 + output_attn1
         x_1 = x_1 + self.mlp1(self.ln_1_2(x_1))
 
         # Second stream: attention then MLP
-        output_attn2 = self.attn2(self.ln_2_1(x))
-        x_2 = x + output_attn2
+        output_attn2 = self.attn2(self.ln_2_1(x_2))
+        x_2 = x_2 + output_attn2
         x_2 = x_2 + self.mlp2(self.ln_2_2(x_2))
 
         # Reduce after attention only (partial communication)
-        x = add_and_reduce_tensor(x_1, x_2)
+        add_and_reduce_tensor_output = add_and_reduce_tensor(output_attn1, output_attn2)
+        x_1 = x_1 + add_and_reduce_tensor_output
+        x_2 = x_2 + add_and_reduce_tensor_output
 
-        return x
-class ShardBlockFullCommunication(nn.Module):
+        return x_1, x_2 ### two simulated devices
+class BlockFullCommunication(nn.Module):
     """ 
     This block recovers the exact computation of the original model.
     """
@@ -173,20 +175,24 @@ class ShardBlockFullCommunication(nn.Module):
         self.mlp1 = MLP(config) ## first MLP
         self.mlp2 = MLP(config) ## second MLP
 
-    def forward(self, x):
+    def forward(self, x_1, x_2):
         # First stream: attention
-        output_attn1 = self.attn1(self.ln_1_1(x))
+        output_attn1 = self.attn1(self.ln_1_1(x_1))
         # Second stream: attention
-        output_attn2 = self.attn2(self.ln_2_1(x))
+        output_attn2 = self.attn2(self.ln_2_1(x_2))
         # Reduce after attention (full communication)
-        x = x + add_and_reduce_tensor(output_attn1, output_attn2)
+        add_and_reduce_tensor_output = add_and_reduce_tensor(output_attn1, output_attn2)
+        x_1 = x_1 + add_and_reduce_tensor_output
+        x_2 = x_2 + add_and_reduce_tensor_output
         # First stream: MLP
-        linear_output1 = self.mlp1(self.ln_1_2(x))
+        linear_output1 = self.mlp1(self.ln_1_2(x_1))
         # Second stream: MLP
-        linear_output2 = self.mlp2(self.ln_2_2(x))
+        linear_output2 = self.mlp2(self.ln_2_2(x_2))
         # Reduce after MLP (full communication)
-        x = x + add_and_reduce_tensor(linear_output1, linear_output2)
-        return x
+        add_and_reduce_tensor_output = add_and_reduce_tensor(linear_output1, linear_output2)
+        x_1 = x_1 + add_and_reduce_tensor_output
+        x_2 = x_2 + add_and_reduce_tensor_output
+        return x_1, x_2 ### two simulated devices
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -208,12 +214,12 @@ class GPT(nn.Module):
         self.pattern = config.pattern if config.pattern is not None else ["full_communication"]*config.n_layer
         for i in range(config.n_layer):
             if self.pattern[i] == "full_communication":
-                list_of_blocks.append(ShardBlockFullCommunication(config))
+                list_of_blocks.append(BlockFullCommunication(config))
             elif self.pattern[i] == "partial_communication":
-                list_of_blocks.append(ShardBlockPartialCommunication(config))
+                list_of_blocks.append(BlockPartialCommunication(config))
             elif self.pattern[i] == "no_communication":
-                list_of_blocks.append(ShardBlockNoCommunication(config)) 
-                list_of_blocks.append(ShardBlockNoCommunication(config))
+                list_of_blocks.append(BlockNoCommunication(config)) 
+                list_of_blocks.append(BlockNoCommunication(config))
             else:
                 raise ValueError(f"Invalid pattern: {self.pattern[i]}")
         self.transformer = nn.ModuleDict(dict(
@@ -272,18 +278,15 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
 
         # Maintain two streams (x_1, x_2) and a separate index into the ModuleList
-        x_1 = x
-        x_2 = x
+        x_1 = x.clone().detach() ### for the first simulated device
+        x_2 = x.clone().detach() ### for the second simulated device
         block_idx = 0
         for i in range(len(self.pattern)):
             pat = self.pattern[i]
             if pat == "full_communication" or pat == "partial_communication":
                 # Reduce, run a single shared block, then broadcast to both streams
-                x = add_and_reduce_tensor(x_1, x_2)
-                x = self.transformer.h[block_idx](x)
+                x_1, x_2 = self.transformer.h[block_idx](x_1, x_2)
                 block_idx += 1
-                x_1 = x
-                x_2 = x
             elif pat == "no_communication":
                 # Advance each stream with its own consecutive block
                 x_1 = self.transformer.h[block_idx](x_1)

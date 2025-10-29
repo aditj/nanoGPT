@@ -13,16 +13,19 @@ for exp_name in exps_name:
         if file_name.endswith('.pkl'):
             with open(os.path.join(output_dir, exp_name, file_name), 'rb') as f:
                 data = pickle.load(f)
-            print(len(data['steps']))
-            if len(data['steps']) != 11:
+            
+            if len(data['steps']) != 101:
                 continue
             label = exp_name.split('_')[-1]
+            if label == '24':
+                continue
+            
             ax.plot(data['steps'], data['val_losses'], label=label)
-plt.legend()
+ax.legend(fontsize=14,title = "Number of Synchronous Operations")
+ax.hlines(y=3.28, xmin=0, xmax=20000, color='red', linestyle='--')
 plt.yscale('log')
 plt.xlabel('iter', fontsize=14)
 plt.ylabel('val loss', fontsize=14)
 plt.title('val loss', fontsize=14)
-plt.legend(fontsize=14,title = "Number of Synchronous Operations")
 plt.savefig(os.path.join(output_dir, 'val_loss.png'))
 plt.close()
